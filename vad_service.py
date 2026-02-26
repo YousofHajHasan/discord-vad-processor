@@ -148,9 +148,9 @@ def pcm_to_mp3(pcm_path: Path) -> Path:
         "ffmpeg", "-y",
         "-f", "s16le", "-ar", "48000", "-ac", "2",
         "-i", str(pcm_path),
-        "-loglevel", "error",
+        "-loglevel", "quiet",
         str(mp3_path),
-    ])
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if result.returncode == 0 and mp3_path.exists():
         pcm_path.unlink()
         log.info(f"  Converted PCM -> {mp3_path.name}")
@@ -186,8 +186,8 @@ def merge_parts(folder: Path, date_str: str) -> Path:
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
         "-i", str(list_file), "-c", "copy", str(daily_file),
-        "-loglevel", "error",
-    ], check=False)
+        "-loglevel", "quiet",
+    ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     list_file.unlink(missing_ok=True)
     if temp and temp.exists():
