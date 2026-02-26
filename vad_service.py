@@ -136,9 +136,9 @@ def load_audio_ffmpeg(path: Path) -> np.ndarray:
     cmd = [
         "ffmpeg", "-y", "-i", str(path),
         "-ac", "1", "-ar", str(SAMPLE_RATE),
-        "-f", "f32le", "-loglevel", "error", "pipe:1",
+        "-f", "f32le", "-loglevel", "quiet", "pipe:1",
     ]
-    raw = subprocess.run(cmd, stdout=subprocess.PIPE, check=True).stdout
+    raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True).stdout
     return np.frombuffer(raw, dtype=np.float32).copy()
 
 
