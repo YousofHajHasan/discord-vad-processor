@@ -132,14 +132,33 @@ def get_speech_timestamps(audio: np.ndarray, vad: SileroVAD) -> list:
 
 
 # -- Audio helpers -------------------------------------------------------------
-def load_audio_ffmpeg(path: Path) -> np.ndarray:
-    cmd = [
-        "ffmpeg", "-y", "-i", str(path),
+def load_audio_ffmpeg(path: Path, start_sec: float = 0.0) -> np.ndarray:
+    """Decode audio to float32 mono 16kHz. If start_sec > 0, seek before decoding
+    so we never load the already-processed portion into RAM."""
+    cmd = ["ffmpeg", "-y"]
+    if start_sec > 0:
+        cmd += ["-ss", f"{start_sec:.3f}"]
+    cmd += [
+        "-i", str(path),
         "-ac", "1", "-ar", str(SAMPLE_RATE),
         "-f", "f32le", "-loglevel", "quiet", "pipe:1",
     ]
     raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True).stdout
     return np.frombuffer(raw, dtype=np.float32).copy()
+
+
+def get_file_duration_sec(path: Path) -> float:
+    """Fast probe of audio duration using ffprobe, no decode."""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", str(path)
+    ]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        info = json.loads(r.stdout)
+        return float(info["streams"][0]["duration"])
+    except Exception:
+        return 0.0
 
 
 def pcm_to_mp3(pcm_path: Path) -> Path:
@@ -230,8 +249,8 @@ def state_key(user_dir: Path, date_str: str) -> str:
 def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
                          vad: SileroVAD, state: dict) -> bool:
     """
-    Decode full daily file, skip already-processed samples, run VAD on the
-    new tail only, append chunk_NNN.wav files numbered after existing ones.
+    Uses ffprobe to check total duration, then decodes ONLY the new tail
+    via ffmpeg -ss seek. Never loads the full file into RAM.
     Returns True if state was modified.
     """
     key   = state_key(user_dir, date_str)
@@ -239,31 +258,33 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
 
     prev_samples = int(entry.get("processed_samples", 0))
     prev_chunks  = int(entry.get("chunk_count", 0))
+    prev_sec     = prev_samples / SAMPLE_RATE
 
-    try:
-        audio = load_audio_ffmpeg(daily_file)
-    except Exception as e:
-        log.error(f"  Failed to decode {daily_file}: {e}")
-        return False
-
-    total_samples = len(audio)
+    # Fast check: probe total duration without decoding
+    total_sec     = get_file_duration_sec(daily_file)
+    total_samples = int(total_sec * SAMPLE_RATE)
 
     if total_samples <= prev_samples:
         log.debug(
             f"  [{user_dir.name}/{date_str}] "
-            f"No new audio (total={total_samples}, done={prev_samples})"
+            f"No new audio (total={total_sec:.1f}s, done={prev_sec:.1f}s)"
         )
         return False
 
-    new_seconds = (total_samples - prev_samples) / SAMPLE_RATE
+    new_seconds = total_sec - prev_sec
     log.info(
         f"  [{user_dir.name}/{date_str}] "
         f"+{new_seconds:.1f}s new audio  "
-        f"(total {total_samples/SAMPLE_RATE:.1f}s, "
-        f"already processed {prev_samples/SAMPLE_RATE:.1f}s)"
+        f"(total {total_sec:.1f}s, already processed {prev_sec:.1f}s)"
     )
 
-    new_audio  = audio[prev_samples:]
+    # Decode only the new tail — seek to prev_sec before decoding
+    try:
+        new_audio = load_audio_ffmpeg(daily_file, start_sec=prev_sec)
+    except Exception as e:
+        log.error(f"  Failed to decode {daily_file}: {e}")
+        return False
+
     timestamps = get_speech_timestamps(new_audio, vad)
     log.info(f"  Found {len(timestamps)} new speech segment(s).")
 
