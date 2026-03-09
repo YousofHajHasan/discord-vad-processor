@@ -6,6 +6,7 @@ Watches Recordings/ for new or grown daily MP3 files, then:
   1. Converts .pcm -> .mp3
   2. Merges *_part*.mp3 into YYYY-MM-DD.mp3
   3. Runs Silero VAD only on the NEW audio tail since last run
+     - Processes in WINDOW_MINUTES windows to keep RAM flat
      - State stores, per user+date: "processed_samples" (int)
      - On next scan: decode full file, skip the first N samples,
        run VAD on the rest, append chunk_NNN.wav files numbered
@@ -49,6 +50,11 @@ VAD_THRESHOLD    = float(os.environ.get("VAD_THRESHOLD",  "0.5"))
 SILENCE_SEC      = float(os.environ.get("SILENCE_SEC",    "1.0"))
 MIN_SPEECH_MS    = int(os.environ.get("MIN_SPEECH_MS",    "250"))
 SPEECH_PAD_MS    = int(os.environ.get("SPEECH_PAD_MS",    "30"))
+
+# -- FIX: Process audio in windows instead of loading the entire tail at once.
+# 10 minutes × 16000 samples × 4 bytes = ~38MB per window instead of 2.2GB.
+WINDOW_MINUTES   = int(os.environ.get("WINDOW_MINUTES",   "10"))
+WINDOW_SECONDS   = WINDOW_MINUTES * 60
 
 
 # -- Silero VAD ONNX wrapper --------------------------------------------------
@@ -132,18 +138,27 @@ def get_speech_timestamps(audio: np.ndarray, vad: SileroVAD) -> list:
 
 
 # -- Audio helpers -------------------------------------------------------------
-def load_audio_ffmpeg(path: Path, start_sec: float = 0.0) -> np.ndarray:
-    """Decode audio to float32 mono 16kHz. If start_sec > 0, seek before decoding
-    so we never load the already-processed portion into RAM."""
+def load_audio_ffmpeg(path: Path, start_sec: float = 0.0,
+                      duration_sec: float = None) -> np.ndarray:
+    """
+    Decode audio to float32 mono 16kHz.
+    start_sec   — seek to this position before decoding (skips already-processed audio)
+    duration_sec — decode at most this many seconds (None = decode to end of file)
+    Keeping both parameters allows windowed decoding: load only one chunk at a time.
+    """
     cmd = ["ffmpeg", "-y"]
     if start_sec > 0:
         cmd += ["-ss", f"{start_sec:.3f}"]
+    cmd += ["-i", str(path)]
+    if duration_sec is not None:
+        cmd += ["-t", f"{duration_sec:.3f}"]
     cmd += [
-        "-i", str(path),
         "-ac", "1", "-ar", str(SAMPLE_RATE),
         "-f", "f32le", "-loglevel", "quiet", "pipe:1",
     ]
-    raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True).stdout
+    raw = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True
+    ).stdout
     return np.frombuffer(raw, dtype=np.float32).copy()
 
 
@@ -229,9 +244,15 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
+    """
+    Atomic write — write to a temp file then rename so a crash mid-write
+    never corrupts the state file.
+    """
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
+    tmp.replace(STATE_FILE)
 
 
 def is_stable(path: Path) -> bool:
@@ -245,13 +266,20 @@ def state_key(user_dir: Path, date_str: str) -> str:
     return f"{user_dir.name}:{date_str}"
 
 
-# -- Incremental VAD processing ------------------------------------------------
+# -- Incremental VAD processing (windowed) ------------------------------------
 def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
-                         vad: SileroVAD, state: dict) -> bool:
+                        vad: SileroVAD, state: dict) -> bool:
     """
-    Uses ffprobe to check total duration, then decodes ONLY the new tail
-    via ffmpeg -ss seek. Never loads the full file into RAM.
-    Returns True if state was modified.
+    Processes only the new audio tail since the last run, in WINDOW_SECONDS
+    windows to keep peak RAM usage flat regardless of file size.
+
+    For each window:
+      1. Decode WINDOW_SECONDS of audio starting at current offset
+      2. Run VAD, write any speech chunks to disk
+      3. Advance state by the window size
+      4. Save state immediately — crash-safe per window
+
+    Returns True if any state was modified.
     """
     key   = state_key(user_dir, date_str)
     entry = state.get(key, {"processed_samples": 0, "chunk_count": 0})
@@ -274,46 +302,76 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
     new_seconds = total_sec - prev_sec
     log.info(
         f"  [{user_dir.name}/{date_str}] "
-        f"+{new_seconds:.1f}s new audio  "
-        f"(total {total_sec:.1f}s, already processed {prev_sec:.1f}s)"
+        f"+{new_seconds:.1f}s new audio to process "
+        f"(total {total_sec:.1f}s, already done {prev_sec:.1f}s) "
+        f"in {int(np.ceil(new_seconds / WINDOW_SECONDS))} window(s) "
+        f"of {WINDOW_MINUTES}min each"
     )
 
-    # Decode only the new tail — seek to prev_sec before decoding
-    try:
-        new_audio = load_audio_ffmpeg(daily_file, start_sec=prev_sec)
-    except Exception as e:
-        log.error(f"  Failed to decode {daily_file}: {e}")
-        return False
+    chunks_dir  = user_dir / "chunks" / date_str
+    current_sec = prev_sec
+    chunk_count = prev_chunks
+    changed     = False
 
-    timestamps = get_speech_timestamps(new_audio, vad)
-    log.info(f"  Found {len(timestamps)} new speech segment(s).")
+    while current_sec < total_sec:
+        window_dur = min(WINDOW_SECONDS, total_sec - current_sec)
 
-    # Always advance the offset, even if no speech was found
-    new_entry = {
-        "processed_samples": total_samples,
-        "chunk_count": prev_chunks,
-        "last_run": datetime.utcnow().isoformat(),
-    }
+        # Decode one window — peak RAM = ~38MB for 10 min of mono 16kHz float32
+        try:
+            window_audio = load_audio_ffmpeg(
+                daily_file,
+                start_sec=current_sec,
+                duration_sec=window_dur,
+            )
+        except Exception as e:
+            log.error(f"  Failed to decode window at {current_sec:.1f}s: {e}")
+            break
 
-    if timestamps:
-        chunks_dir = user_dir / "chunks" / date_str
-        chunks_dir.mkdir(parents=True, exist_ok=True)
+        if len(window_audio) == 0:
+            break
 
-        for i, ts in enumerate(timestamps):
-            chunk    = new_audio[ts["start"] : ts["end"]]
-            idx      = prev_chunks + i + 1
-            out_path = chunks_dir / f"chunk_{idx:03d}.wav"
-            sf.write(str(out_path), chunk, SAMPLE_RATE)
+        timestamps = get_speech_timestamps(window_audio, vad)
 
-        new_chunk_count = prev_chunks + len(timestamps)
-        log.info(
-            f"  Saved chunk_{prev_chunks+1:03d}.wav ... chunk_{new_chunk_count:03d}.wav"
-            f"  -> {chunks_dir}"
-        )
-        new_entry["chunk_count"] = new_chunk_count
+        if timestamps:
+            chunks_dir.mkdir(parents=True, exist_ok=True)
+            for i, ts in enumerate(timestamps):
+                chunk    = window_audio[ts["start"] : ts["end"]]
+                idx      = chunk_count + i + 1
+                out_path = chunks_dir / f"chunk_{idx:03d}.wav"
+                sf.write(str(out_path), chunk, SAMPLE_RATE)
 
-    state[key] = new_entry
-    return True
+            new_count = chunk_count + len(timestamps)
+            log.info(
+                f"  [{user_dir.name}/{date_str}] "
+                f"window {current_sec:.0f}s-{current_sec+window_dur:.0f}s: "
+                f"{len(timestamps)} segment(s) -> "
+                f"chunk_{chunk_count+1:03d}.wav ... chunk_{new_count:03d}.wav"
+            )
+            chunk_count = new_count
+        else:
+            log.debug(
+                f"  [{user_dir.name}/{date_str}] "
+                f"window {current_sec:.0f}s-{current_sec+window_dur:.0f}s: "
+                f"no speech"
+            )
+
+        # Advance offset by actual decoded samples (more accurate than duration)
+        current_sec += len(window_audio) / SAMPLE_RATE
+
+        # Update and save state after every window so a crash loses at most
+        # one window of work instead of the entire file
+        state[key] = {
+            "processed_samples": int(current_sec * SAMPLE_RATE),
+            "chunk_count":       chunk_count,
+            "last_run":          datetime.utcnow().isoformat(),
+        }
+        save_state(state)
+        changed = True
+
+        # Explicitly free the window array before decoding the next one
+        del window_audio
+
+    return changed
 
 
 # -- Main watchdog loop --------------------------------------------------------
@@ -326,6 +384,10 @@ def scan_once(vad: SileroVAD, state: dict) -> bool:
 
     for user_dir in sorted(RECORDINGS_DIR.iterdir()):
         if not user_dir.is_dir():
+            continue
+
+        # Skip non-numeric folders (username.txt, temp files, etc.)
+        if not user_dir.name.isdigit():
             continue
 
         # 1. Convert leftover .pcm files
@@ -365,6 +427,7 @@ def main():
     log.info(f"  Stability window: {STABILITY_WINDOW}s")
     log.info(f"  VAD threshold   : {VAD_THRESHOLD}")
     log.info(f"  Silence gap     : {SILENCE_SEC}s")
+    log.info(f"  Decode window   : {WINDOW_MINUTES}min ({WINDOW_SECONDS}s)")
 
     if not ONNX_MODEL.exists():
         log.error(f"ONNX model not found at {ONNX_MODEL}. Exiting.")
@@ -376,9 +439,7 @@ def main():
 
     while True:
         try:
-            changed = scan_once(vad, state)
-            if changed:
-                save_state(state)
+            scan_once(vad, state)
         except Exception as e:
             log.error(f"Scan error: {e}")
         time.sleep(POLL_INTERVAL)
