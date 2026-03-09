@@ -245,10 +245,8 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_name(STATE_FILE.name + ".tmp")
-    with open(tmp, "w") as f:
+    with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
-    os.replace(str(tmp), str(STATE_FILE))
 
 def is_stable(path: Path) -> bool:
     try:
