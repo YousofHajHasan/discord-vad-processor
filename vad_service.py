@@ -47,7 +47,7 @@ STABILITY_WINDOW = int(os.environ.get("STABILITY_WINDOW", "30"))
 
 SAMPLE_RATE      = 16000
 VAD_THRESHOLD    = float(os.environ.get("VAD_THRESHOLD",  "0.5"))
-SILENCE_SEC      = float(os.environ.get("SILENCE_SEC",    "0.4"))
+SILENCE_SEC      = float(os.environ.get("SILENCE_SEC",    "1.0")) # I'm just an idiot, I was changing the default value :)) instead of changing the env var.. 
 MIN_SPEECH_MS    = int(os.environ.get("MIN_SPEECH_MS",    "250"))
 SPEECH_PAD_MS    = int(os.environ.get("SPEECH_PAD_MS",    "30"))
 
