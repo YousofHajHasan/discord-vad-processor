@@ -3,21 +3,17 @@ VAD Processor Service  (incremental / always-running)
 ──────────────────────────────────────────────────────
 Watches Recordings/ for new or grown daily MP3 files, then:
 
-  1. Converts .pcm -> .mp3
-  2. Merges *_part*.mp3 into YYYY-MM-DD.mp3
-  3. Runs Silero VAD only on the NEW audio tail since last run
+  1. Runs Silero VAD only on the NEW audio tail since last run
      - Processes in WINDOW_MINUTES windows to keep RAM flat
      - State stores, per user+date: "processed_samples" (int)
-     - On next scan: decode full file, skip the first N samples,
-       run VAD on the rest, append chunk_NNN.wav files numbered
-       after the existing ones
-  4. Loops forever with POLL_INTERVAL sleep
+     - On next scan: seek into file, run VAD on the rest,
+       append chunk_NNN.wav files numbered after existing ones
+  2. Loops forever with POLL_INTERVAL sleep
 
 Chunk filenames reflect the order they were created, so they are
 always sorted chronologically when listed alphabetically:
     chunk_001.wav  -> first speech segment ever found
     chunk_002.wav  -> second, etc.
-    (new ones appended: chunk_006.wav, chunk_007.wav ...)
 """
 
 import os
@@ -30,6 +26,7 @@ import onnxruntime as ort
 import soundfile as sf
 from pathlib import Path
 from datetime import datetime
+from mutagen.mp3 import MP3
 
 # -- Logging ------------------------------------------------------------------
 logging.basicConfig(
@@ -42,18 +39,16 @@ log = logging.getLogger(__name__)
 RECORDINGS_DIR   = Path(os.environ.get("RECORDINGS_PATH",  "/app/recordings"))
 ONNX_MODEL       = Path(os.environ.get("ONNX_MODEL_PATH",  "/app/silero_vad.onnx"))
 STATE_FILE       = Path(os.environ.get("STATE_FILE",       "/app/processed.json"))
-POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL",    "30"))
-STABILITY_WINDOW = int(os.environ.get("STABILITY_WINDOW", "30"))
+POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL",     "30"))
+STABILITY_WINDOW = int(os.environ.get("STABILITY_WINDOW",  "30"))
 
 SAMPLE_RATE      = 16000
-VAD_THRESHOLD    = float(os.environ.get("VAD_THRESHOLD",  "0.5"))
-SILENCE_SEC      = float(os.environ.get("SILENCE_SEC",    "1.0")) # I'm just an idiot, I was changing the default value :)) instead of changing the env var.. 
-MIN_SPEECH_MS    = int(os.environ.get("MIN_SPEECH_MS",    "250"))
-SPEECH_PAD_MS    = int(os.environ.get("SPEECH_PAD_MS",    "30"))
+VAD_THRESHOLD    = float(os.environ.get("VAD_THRESHOLD",   "0.5"))
+SILENCE_SEC      = float(os.environ.get("SILENCE_SEC",     "1.0"))
+MIN_SPEECH_MS    = int(os.environ.get("MIN_SPEECH_MS",     "250"))
+SPEECH_PAD_MS    = int(os.environ.get("SPEECH_PAD_MS",     "30"))
 
-# -- FIX: Process audio in windows instead of loading the entire tail at once.
-# 10 minutes × 16000 samples × 4 bytes = ~38MB per window instead of 2.2GB.
-WINDOW_MINUTES   = int(os.environ.get("WINDOW_MINUTES",   "10"))
+WINDOW_MINUTES   = int(os.environ.get("WINDOW_MINUTES",    "10"))
 WINDOW_SECONDS   = WINDOW_MINUTES * 60
 
 
@@ -137,14 +132,13 @@ def get_speech_timestamps(audio: np.ndarray, vad: SileroVAD) -> list:
     return speeches
 
 
-# -- Audio helpers -------------------------------------------------------------
+# -- Audio helpers ------------------------------------------------------------
 def load_audio_ffmpeg(path: Path, start_sec: float = 0.0,
                       duration_sec: float = None) -> np.ndarray:
     """
     Decode audio to float32 mono 16kHz.
-    start_sec   — seek to this position before decoding (skips already-processed audio)
-    duration_sec — decode at most this many seconds (None = decode to end of file)
-    Keeping both parameters allows windowed decoding: load only one chunk at a time.
+    start_sec    — seek to this position before decoding
+    duration_sec — decode at most this many seconds (None = to end of file)
     """
     cmd = ["ffmpeg", "-y"]
     if start_sec > 0:
@@ -163,76 +157,25 @@ def load_audio_ffmpeg(path: Path, start_sec: float = 0.0,
 
 
 def get_file_duration_sec(path: Path) -> float:
-    """Fast probe of audio duration using ffprobe, no decode."""
-    cmd = [
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_streams", str(path)
-    ]
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    """
+    Read MP3 duration from header metadata only — no seeking, no decoding.
+    Replaces the old ffprobe-based implementation that caused ~1TB/day of
+    unnecessary disk reads by seeking through the entire file on every call.
+    """
     try:
-        info = json.loads(r.stdout)
-        return float(info["streams"][0]["duration"])
+        return MP3(path).info.length
     except Exception:
         return 0.0
 
 
-def pcm_to_mp3(pcm_path: Path) -> Path:
-    mp3_path = pcm_path.with_suffix(".mp3")
-    result = subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "s16le", "-ar", "48000", "-ac", "2",
-        "-i", str(pcm_path),
-        "-loglevel", "quiet",
-        str(mp3_path),
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if result.returncode == 0 and mp3_path.exists():
-        pcm_path.unlink()
-        log.info(f"  Converted PCM -> {mp3_path.name}")
-        return mp3_path
-    log.warning(f"  Failed to convert {pcm_path.name}")
-    return None
+def is_stable(path: Path) -> bool:
+    try:
+        return (time.time() - path.stat().st_mtime) >= STABILITY_WINDOW
+    except FileNotFoundError:
+        return False
 
 
-def merge_parts(folder: Path, date_str: str) -> Path:
-    """Merge stable *_part*.mp3 (+ any existing daily file) into YYYY-MM-DD.mp3."""
-    parts = sorted(folder.glob("*_part*.mp3"))
-    if not parts:
-        return None
-
-    daily_file      = folder / f"{date_str}.mp3"
-    list_file       = folder / "_merge_list.txt"
-    files_to_concat = []
-
-    if daily_file.exists():
-        temp = folder / f"_temp_{date_str}.mp3"
-        daily_file.rename(temp)
-        files_to_concat.append(temp)
-    else:
-        temp = None
-
-    files_to_concat.extend(parts)
-
-    with open(list_file, "w") as f:
-        for p in files_to_concat:
-            f.write(f"file '{p.resolve()}'\n")
-
-    log.info(f"  Merging {len(parts)} part(s) -> {daily_file.name}")
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(list_file), "-c", "copy", str(daily_file),
-        "-loglevel", "quiet",
-    ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    list_file.unlink(missing_ok=True)
-    if temp and temp.exists():
-        temp.unlink()
-    for p in parts:
-        p.unlink(missing_ok=True)
-
-    return daily_file if daily_file.exists() else None
-
-
-# -- State tracking ------------------------------------------------------------
+# -- State tracking -----------------------------------------------------------
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
@@ -247,12 +190,6 @@ def save_state(state: dict):
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
-
-def is_stable(path: Path) -> bool:
-    try:
-        return (time.time() - path.stat().st_mtime) >= STABILITY_WINDOW
-    except FileNotFoundError:
-        return False
 
 
 def state_key(user_dir: Path, date_str: str) -> str:
@@ -281,7 +218,7 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
     prev_chunks  = int(entry.get("chunk_count", 0))
     prev_sec     = prev_samples / SAMPLE_RATE
 
-    # Fast check: probe total duration without decoding
+    # Read duration from MP3 headers only (~10KB), not by seeking the file
     total_sec     = get_file_duration_sec(daily_file)
     total_samples = int(total_sec * SAMPLE_RATE)
 
@@ -309,7 +246,6 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
     while current_sec < total_sec:
         window_dur = min(WINDOW_SECONDS, total_sec - current_sec)
 
-        # Decode one window — peak RAM = ~38MB for 10 min of mono 16kHz float32
         try:
             window_audio = load_audio_ffmpeg(
                 daily_file,
@@ -348,11 +284,8 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
                 f"no speech"
             )
 
-        # Advance offset by actual decoded samples (more accurate than duration)
         current_sec += len(window_audio) / SAMPLE_RATE
 
-        # Update and save state after every window so a crash loses at most
-        # one window of work instead of the entire file
         state[key] = {
             "processed_samples": int(current_sec * SAMPLE_RATE),
             "chunk_count":       chunk_count,
@@ -361,13 +294,12 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
         save_state(state)
         changed = True
 
-        # Explicitly free the window array before decoding the next one
         del window_audio
 
     return changed
 
 
-# -- Main watchdog loop --------------------------------------------------------
+# -- Main watchdog loop -------------------------------------------------------
 def scan_once(vad: SileroVAD, state: dict) -> bool:
     changed = False
 
@@ -378,26 +310,9 @@ def scan_once(vad: SileroVAD, state: dict) -> bool:
     for user_dir in sorted(RECORDINGS_DIR.iterdir()):
         if not user_dir.is_dir():
             continue
-
-        # Skip non-numeric folders (username.txt, temp files, etc.)
         if not user_dir.name.isdigit():
             continue
 
-        # 1. Convert leftover .pcm files
-        for pcm in user_dir.glob("*.pcm"):
-            if is_stable(pcm):
-                pcm_to_mp3(pcm)
-
-        # 2. Merge stable _part*.mp3 -> today's daily file
-        stable_parts = [p for p in sorted(user_dir.glob("*_part*.mp3")) if is_stable(p)]
-        if stable_parts:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-            merged   = merge_parts(user_dir, date_str)
-            if merged:
-                log.info(f"[{user_dir.name}] Merged parts -> {merged.name}")
-                changed = True
-
-        # 3. Incremental VAD on every daily MP3
         for daily_file in sorted(user_dir.glob("????-??-??.mp3")):
             if not is_stable(daily_file):
                 log.debug(f"  Skipping {daily_file.name} (still being written)")
