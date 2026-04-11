@@ -401,6 +401,25 @@ def scan_once(vad: SileroVAD, state: dict) -> bool:
                     changed = True
             except Exception as e:
                 log.error(f"[{user_dir.name}] Error on {daily_file.name}: {e}")
+                continue
+
+            # After processing a past-date file, check if the remaining tail
+            # is now under the tolerance threshold and mark complete if so.
+            # Handles the case where current_sec lands just short of total_sec
+            # due to floating-point, leaving is_complete=False in process_incremental.
+            if date_str < today and not state.get(key, {}).get("complete"):
+                total_sec = get_file_duration_sec(daily_file)
+                prev_sec  = state.get(key, {}).get("processed_samples", 0) / SAMPLE_RATE
+                tail_sec  = total_sec - prev_sec
+                if tail_sec < COMPLETE_TAIL_TOLERANCE_SEC:
+                    state[key] = {**state.get(key, {}), "complete": True}
+                    save_state(state)
+                    log.info(
+                        f"  [{user_dir.name}/{date_str}] "
+                        f"Marked complete after processing "
+                        f"(tail {tail_sec:.2f}s < {COMPLETE_TAIL_TOLERANCE_SEC}s tolerance)"
+                    )
+                    changed = True
 
     return changed
 
