@@ -8,9 +8,8 @@ Watches Recordings/ for new or grown daily MP3 files, then:
      - State stores, per user+date: "processed_samples" (int)
      - On next scan: seek into file, run VAD on the rest,
        append chunk_NNN.wav files numbered after existing ones
-     - Past-date files that are fully processed are marked
-       "complete: true" and skipped on all future scans —
-       this is what eliminates the TB of unnecessary disk reads
+     - Past-date files are marked "complete: true" and skipped
+       on all future scans — this eliminates TB-scale disk reads
   2. Loops forever with POLL_INTERVAL sleep
 
 Chunk filenames reflect the order they were created, so they are
@@ -26,8 +25,17 @@ Why ffprobe instead of mutagen for duration:
     If prev_samples was written by ffprobe and mutagen returns fewer
     total_samples, every file looks "already done" and no new audio
     ever gets processed. The TB problem is solved by the complete
-    flag — ffprobe is only called on today's active file, not on
-    every historical file on every scan.
+    flag — ffprobe is only called on active files, not on every
+    historical file on every scan.
+
+Why the <1s tolerance in scan_once:
+    ffprobe has small floating-point variance between calls on the
+    same file (~0.1-0.3s). Past-date files that are truly done keep
+    showing +0.0s / +0.1s tails that never resolve to complete=True
+    because current_sec never quite reaches total_sec after decoding
+    a near-empty window. Skipping files with a tail under 1 second
+    on a past date avoids wasting a full ffprobe + ffmpeg decode
+    cycle on noise, and marks them complete immediately.
 """
 
 import os
@@ -63,6 +71,11 @@ SPEECH_PAD_MS    = int(os.environ.get("SPEECH_PAD_MS",     "30"))
 
 WINDOW_MINUTES   = int(os.environ.get("WINDOW_MINUTES",    "10"))
 WINDOW_SECONDS   = WINDOW_MINUTES * 60
+
+# Past-date files with a remaining tail shorter than this are considered done.
+# Exists to absorb ffprobe floating-point variance (~0.1-0.3s) that would
+# otherwise keep files stuck in a never-complete loop.
+COMPLETE_TAIL_TOLERANCE_SEC = 1.0
 
 
 # -- Silero VAD ONNX wrapper --------------------------------------------------
@@ -230,7 +243,7 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
 
     Past-date files that are fully processed are marked complete=True
     so scan_once() can skip them on all future scans without touching
-    the file at all — eliminating the disk I/O problem.
+    the file at all.
 
     Returns True if any state was modified.
     """
@@ -245,7 +258,6 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
     total_samples = int(total_sec * SAMPLE_RATE)
 
     if total_samples <= prev_samples:
-        # Nothing new — mark past-date files complete so we never open them again
         if date_str < today and not entry.get("complete"):
             state[key] = {**entry, "complete": True}
             save_state(state)
@@ -314,7 +326,6 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
 
         current_sec += len(window_audio) / SAMPLE_RATE
 
-        # Mark complete if this is a past-date file and we've reached the end
         is_complete = (date_str < today) and (current_sec >= total_sec)
 
         state[key] = {
@@ -354,10 +365,10 @@ def scan_once(vad: SileroVAD, state: dict) -> bool:
 
         for daily_file in sorted(user_dir.glob("????-??-??.mp3")):
             date_str = daily_file.stem
+            key      = state_key(user_dir, date_str)
+            entry    = state.get(key, {})
 
-            # Skip past-date files that are fully processed — zero disk reads,
-            # zero ffprobe calls, this is what kills the TB problem
-            entry = state.get(state_key(user_dir, date_str), {})
+            # Skip past-date files already marked complete — zero disk reads
             if entry.get("complete") and date_str < today:
                 log.debug(f"  Skipping {user_dir.name}/{date_str} (complete)")
                 continue
@@ -365,6 +376,25 @@ def scan_once(vad: SileroVAD, state: dict) -> bool:
             if not is_stable(daily_file):
                 log.debug(f"  Skipping {daily_file.name} (still being written)")
                 continue
+
+            # For past-date files: probe duration and mark complete immediately
+            # if the remaining tail is under the tolerance threshold.
+            # This absorbs ffprobe floating-point variance (~0.1-0.3s) that
+            # would otherwise keep files looping forever on a near-zero tail.
+            if date_str < today:
+                total_sec = get_file_duration_sec(daily_file)
+                prev_sec  = entry.get("processed_samples", 0) / SAMPLE_RATE
+                tail_sec  = total_sec - prev_sec
+                if tail_sec < COMPLETE_TAIL_TOLERANCE_SEC:
+                    state[key] = {**entry, "complete": True}
+                    save_state(state)
+                    log.info(
+                        f"  [{user_dir.name}/{date_str}] "
+                        f"Marked complete (tail {tail_sec:.2f}s < "
+                        f"{COMPLETE_TAIL_TOLERANCE_SEC}s tolerance)"
+                    )
+                    changed = True
+                    continue
 
             try:
                 if process_incremental(daily_file, user_dir, date_str, vad, state, today):
