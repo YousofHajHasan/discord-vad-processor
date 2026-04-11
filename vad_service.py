@@ -8,12 +8,26 @@ Watches Recordings/ for new or grown daily MP3 files, then:
      - State stores, per user+date: "processed_samples" (int)
      - On next scan: seek into file, run VAD on the rest,
        append chunk_NNN.wav files numbered after existing ones
+     - Past-date files that are fully processed are marked
+       "complete: true" and skipped on all future scans —
+       this is what eliminates the TB of unnecessary disk reads
   2. Loops forever with POLL_INTERVAL sleep
 
 Chunk filenames reflect the order they were created, so they are
 always sorted chronologically when listed alphabetically:
     chunk_001.wav  -> first speech segment ever found
     chunk_002.wav  -> second, etc.
+
+Why ffprobe instead of mutagen for duration:
+    ffprobe scans frame headers and returns the exact same duration
+    that was used when the state was originally written. mutagen
+    reads the Xing/VBRI tag or estimates from file size for VBR
+    files, which can return a slightly smaller number than reality.
+    If prev_samples was written by ffprobe and mutagen returns fewer
+    total_samples, every file looks "already done" and no new audio
+    ever gets processed. The TB problem is solved by the complete
+    flag — ffprobe is only called on today's active file, not on
+    every historical file on every scan.
 """
 
 import os
@@ -25,8 +39,7 @@ import numpy as np
 import onnxruntime as ort
 import soundfile as sf
 from pathlib import Path
-from datetime import datetime
-from mutagen.mp3 import MP3
+from datetime import datetime, timezone
 
 # -- Logging ------------------------------------------------------------------
 logging.basicConfig(
@@ -158,12 +171,18 @@ def load_audio_ffmpeg(path: Path, start_sec: float = 0.0,
 
 def get_file_duration_sec(path: Path) -> float:
     """
-    Read MP3 duration from header metadata only — no seeking, no decoding.
-    Replaces the old ffprobe-based implementation that caused ~1TB/day of
-    unnecessary disk reads by seeking through the entire file on every call.
+    Probe MP3 duration via ffprobe (frame-accurate, consistent with the
+    sample counts already stored in state). Only called on non-complete
+    files so the TB-scale I/O from the original code does not recur.
     """
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", str(path),
+    ]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
-        return MP3(path).info.length
+        info = json.loads(r.stdout)
+        return float(info["streams"][0]["duration"])
     except Exception:
         return 0.0
 
@@ -198,7 +217,7 @@ def state_key(user_dir: Path, date_str: str) -> str:
 
 # -- Incremental VAD processing (windowed) ------------------------------------
 def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
-                        vad: SileroVAD, state: dict) -> bool:
+                        vad: SileroVAD, state: dict, today: str) -> bool:
     """
     Processes only the new audio tail since the last run, in WINDOW_SECONDS
     windows to keep peak RAM usage flat regardless of file size.
@@ -209,6 +228,10 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
       3. Advance state by the window size
       4. Save state immediately — crash-safe per window
 
+    Past-date files that are fully processed are marked complete=True
+    so scan_once() can skip them on all future scans without touching
+    the file at all — eliminating the disk I/O problem.
+
     Returns True if any state was modified.
     """
     key   = state_key(user_dir, date_str)
@@ -218,15 +241,20 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
     prev_chunks  = int(entry.get("chunk_count", 0))
     prev_sec     = prev_samples / SAMPLE_RATE
 
-    # Read duration from MP3 headers only (~10KB), not by seeking the file
     total_sec     = get_file_duration_sec(daily_file)
     total_samples = int(total_sec * SAMPLE_RATE)
 
     if total_samples <= prev_samples:
-        log.debug(
-            f"  [{user_dir.name}/{date_str}] "
-            f"No new audio (total={total_sec:.1f}s, done={prev_sec:.1f}s)"
-        )
+        # Nothing new — mark past-date files complete so we never open them again
+        if date_str < today and not entry.get("complete"):
+            state[key] = {**entry, "complete": True}
+            save_state(state)
+            log.info(f"  [{user_dir.name}/{date_str}] Marked complete")
+        else:
+            log.debug(
+                f"  [{user_dir.name}/{date_str}] "
+                f"No new audio (total={total_sec:.1f}s, done={prev_sec:.1f}s)"
+            )
         return False
 
     new_seconds = total_sec - prev_sec
@@ -286,15 +314,25 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
 
         current_sec += len(window_audio) / SAMPLE_RATE
 
+        # Mark complete if this is a past-date file and we've reached the end
+        is_complete = (date_str < today) and (current_sec >= total_sec)
+
         state[key] = {
             "processed_samples": int(current_sec * SAMPLE_RATE),
             "chunk_count":       chunk_count,
-            "last_run":          datetime.utcnow().isoformat(),
+            "last_run":          datetime.now(timezone.utc).isoformat(),
+            "complete":          is_complete,
         }
         save_state(state)
         changed = True
 
         del window_audio
+
+    if state[key].get("complete"):
+        log.info(
+            f"  [{user_dir.name}/{date_str}] "
+            f"Marked complete — will skip on future scans"
+        )
 
     return changed
 
@@ -302,6 +340,7 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
 # -- Main watchdog loop -------------------------------------------------------
 def scan_once(vad: SileroVAD, state: dict) -> bool:
     changed = False
+    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     if not RECORDINGS_DIR.exists():
         log.warning(f"Recordings dir not found: {RECORDINGS_DIR}")
@@ -314,12 +353,21 @@ def scan_once(vad: SileroVAD, state: dict) -> bool:
             continue
 
         for daily_file in sorted(user_dir.glob("????-??-??.mp3")):
+            date_str = daily_file.stem
+
+            # Skip past-date files that are fully processed — zero disk reads,
+            # zero ffprobe calls, this is what kills the TB problem
+            entry = state.get(state_key(user_dir, date_str), {})
+            if entry.get("complete") and date_str < today:
+                log.debug(f"  Skipping {user_dir.name}/{date_str} (complete)")
+                continue
+
             if not is_stable(daily_file):
                 log.debug(f"  Skipping {daily_file.name} (still being written)")
                 continue
-            date_str = daily_file.stem
+
             try:
-                if process_incremental(daily_file, user_dir, date_str, vad, state):
+                if process_incremental(daily_file, user_dir, date_str, vad, state, today):
                     changed = True
             except Exception as e:
                 log.error(f"[{user_dir.name}] Error on {daily_file.name}: {e}")
