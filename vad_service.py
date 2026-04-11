@@ -299,6 +299,28 @@ def process_incremental(daily_file: Path, user_dir: Path, date_str: str,
         if len(window_audio) == 0:
             break
 
+        # If we got much less than requested, the file has a corrupt
+        # concatenation boundary (bot reconnection mid-day). Skip past it
+        # instead of getting stuck retrying the same corrupt section forever.
+        expected_samples = int(window_dur * SAMPLE_RATE)
+        if len(window_audio) < expected_samples * 0.1:
+            log.warning(
+                f"  [{user_dir.name}/{date_str}] "
+                f"Decode at {current_sec:.1f}s returned only "
+                f"{len(window_audio)/SAMPLE_RATE:.2f}s of {window_dur:.1f}s "
+                f"requested — likely corrupt boundary, skipping ahead"
+            )
+            current_sec += window_dur
+            state[key] = {
+                "processed_samples": int(current_sec * SAMPLE_RATE),
+                "chunk_count":       chunk_count,
+                "last_run":          datetime.now(timezone.utc).isoformat(),
+                "complete":          (date_str < today) and (current_sec >= total_sec),
+            }
+            save_state(state)
+            changed = True
+            continue
+
         timestamps = get_speech_timestamps(window_audio, vad)
 
         if timestamps:
